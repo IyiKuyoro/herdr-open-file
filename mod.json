@@ -1,0 +1,5 @@
+{
+  "place": "none",
+  "title": "Open file",
+  "overlay": { "kind": "popup", "at": "top", "offset": 50, "width": 720, "height": 0.8 }
+}
