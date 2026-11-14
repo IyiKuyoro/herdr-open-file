@@ -11,7 +11,7 @@ a remote machine lists and opens files there.
 ## Install
 
 ```sh
-git clone https://github.com/<you>/herdr-open-file ~/.config/herdr-app/mods/open-file
+git clone https://github.com/IyiKuyoro/herdr-open-file ~/.config/herdr-app/mods/open-file
 ```
 
 The folder under `mods/` has to be called `open-file`: a mod is named after its
