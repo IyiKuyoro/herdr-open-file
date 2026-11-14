@@ -35,9 +35,12 @@ whatever the Files panel does on a click, cmd+O does too:
 setShared("files.open", {
   command: "pane.split",              // any app command
   args: { direction: "right" },       // its arguments
-  argv: ["/opt/homebrew/bin/nvim"],   // the file's absolute path is appended
+  argv: ["nvim"],                     // the file's absolute path is appended
 });
 ```
+
+Give the program's full path when it is not on the PATH of the shell Herdr starts
+terminals in.
 
 Use `pathArg: "file"` instead of `argv` when the command takes the path as a named
 argument, for example opening a viewer mod in a new tab:
