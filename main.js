@@ -20,18 +20,22 @@ import { spaces, panes, focused, exec, run, theme, props, closeOverlay, shared }
 const OPEN = { command: "pane.split", args: { direction: "right" }, argv: ["nvim"] };
 
 const MAX_FILES = 20000, MAX_ROWS = 300, ROW = 26, LIST_MAX = 390;
+// A folder this mod is pointed at can be a whole home directory, so the shell's
+// answer is cut off at a size worth reading rather than however large it grows.
+const MAX_BYTES = 4 * 1024 * 1024;
 
 // Only for folders that aren't a git repo: git's own ignore rules are better.
 const SKIP = [".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
   "target", "dist", "build", ".next", ".nuxt", ".turbo", ".cache", "vendor",
-  ".terraform", "Pods", ".gradle", ".idea", "DerivedData", ".pytest_cache"];
+  ".terraform", "Pods", ".gradle", ".idea", "DerivedData", ".pytest_cache",
+  "Library", ".Trash", ".npm", ".nvm", ".cargo", ".rustup", ".m2"];
 
 const LIST = `
 cd "$1" 2>/dev/null || { echo "cannot read this folder" >&2; exit 1; }
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git --no-optional-locks -c core.fsmonitor=false ls-files -co --exclude-standard -z
+  git --no-optional-locks -c core.fsmonitor=false ls-files -co --exclude-standard -z | head -c ${MAX_BYTES}
 else
-  find . -type d \\( ${SKIP.map((n) => `-name '${n}'`).join(" -o ")} \\) -prune -o -type f -print0
+  find . -type d \\( ${SKIP.map((n) => `-name '${n}'`).join(" -o ")} \\) -prune -o -type f -print0 | head -c ${MAX_BYTES}
 fi
 `;
 
@@ -46,44 +50,52 @@ function location() {
 async function listFiles(root, on) {
   const r = await exec("sh", ["-c", LIST, "open-file", root], { on, timeout: 20000 });
   if (r.code !== 0) throw new Error((r.stderr || "cannot list this folder").trim());
-  const out = [];
-  for (const path of r.stdout.split("\0")) {
+  // Every entry ends in a NUL, so anything after the last one was cut in half.
+  const whole = r.stdout.slice(0, r.stdout.lastIndexOf("\0") + 1);
+  const paths = [], lower = [], cut = [];
+  for (const path of whole.split("\0")) {
     const p = path.startsWith("./") ? path.slice(2) : path;
-    if (p) out.push(p);
-    if (out.length >= MAX_FILES) break;
+    if (!p) continue;
+    paths.push(p);
+    // Scoring reads these on every keystroke: build them once, not per search.
+    lower.push(p.toLowerCase());
+    cut.push(p.lastIndexOf("/"));
+    if (paths.length >= MAX_FILES) break;
   }
-  return out;
+  return { paths, lower, cut };
 }
 
 // A leftmost-first subsequence match, scored like a fuzzy finder: runs of
 // adjacent letters, starts of path segments and words, and the file's own name
 // all count for more, and shorter paths win ties.
-function score(path, q) {
-  let i = 0, total = 0, prev = -2, run = 0;
-  const slash = path.lastIndexOf("/");
-  for (const ch of q) {
-    const at = path.indexOf(ch, i);
+// `from` is where matching starts: 0 for the whole path, or just past the last
+// slash to score the file's own name, without slicing a string per file.
+function score(path, q, from, slash) {
+  let i = from, total = 0, prev = -2, run = 0;
+  for (let k = 0; k < q.length; k += 1) {
+    const at = path.indexOf(q[k], i);
     if (at < 0) return null;
     let bonus = 0;
     if (at === prev + 1) { run += 1; bonus += 8 + run * 2; } else run = 0;
-    if (at === 0 || "/-_. ".includes(path[at - 1])) bonus += 10;
+    if (at === from || "/-_. ".includes(path[at - 1])) bonus += 10;
     if (at > slash) bonus += 6;
     total += 10 + bonus;
     prev = at; i = at + 1;
   }
-  return total - Math.min(path.length, 240) * 0.08;
+  return total - Math.min(path.length - from, 240) * 0.08;
 }
 
 function rank(files, query) {
+  const { paths, lower, cut } = files;
   const q = query.trim().toLowerCase().replace(/\s+/g, "");
-  if (!q) return files.slice(0, MAX_ROWS).map((path) => ({ path }));
+  if (!q) return paths.slice(0, MAX_ROWS).map((path) => ({ path }));
   const hits = [];
-  for (const path of files) {
-    const lower = path.toLowerCase(), slash = lower.lastIndexOf("/");
-    const whole = score(lower, q);
-    const name = slash < 0 ? null : score(lower.slice(slash + 1), q);
+  for (let i = 0; i < paths.length; i += 1) {
+    const path = lower[i], slash = cut[i];
+    const whole = score(path, q, 0, slash);
+    const name = slash < 0 ? null : score(path, q, slash + 1, slash);
     const best = name === null ? whole : whole === null ? name + 40 : Math.max(whole, name + 40);
-    if (best !== null) hits.push({ path, score: best });
+    if (best !== null) hits.push({ path: paths[i], score: best });
   }
   hits.sort((a, b) => b.score - a.score || a.path.length - b.path.length || a.path.localeCompare(b.path));
   return hits.slice(0, MAX_ROWS);
@@ -99,12 +111,14 @@ export default class OpenFile extends View {
     this.filter = "";
     this.at = 0;
     this.shown = [];
+    this.ranked = null;
     this.handle = cx.focus_handle();
     this.list = ScrollHandle.new();
     this.input = InputState.new({ placeholder: "Open a file…" });
     this.input.on("change", (_e, cx) => {
       this.filter = this.input.value();
       this.at = 0;
+      this.rerank();
       this.list.scroll_to_item(0);
       cx.notify();
     });
@@ -119,8 +133,18 @@ export default class OpenFile extends View {
     cx.spawn(async (cx) => {
       try { this.files = await listFiles(this.root, this.on); }
       catch (e) { this.error = String(e?.message ?? e); }
-      finally { cx.notify(); }
+      finally { this.rerank(); cx.notify(); }
     });
+  }
+
+  // Herdr redraws a view whenever its live data moves — spaces, agents,
+  // terminals, focus. Scoring every path on each of those redraws is what got
+  // this view interrupted, so the list is ranked when the files or the query
+  // change, and a redraw only reads the answer.
+  rerank() {
+    this.shown = this.files ? rank(this.files, this.filter) : [];
+    this.ranked = this.filter;
+    if (this.at >= this.shown.length) this.at = Math.max(0, this.shown.length - 1);
   }
 
   close() {
@@ -161,12 +185,12 @@ export default class OpenFile extends View {
 
   render() {
     const t = theme();
-    this.shown = this.files ? rank(this.files, this.filter) : [];
-    if (this.at >= this.shown.length) this.at = Math.max(0, this.shown.length - 1);
+    if (this.ranked !== this.filter) this.rerank();
+    const total = this.files ? this.files.paths.length : 0;
     const note = this.error ? this.error
       : !this.root ? "This space has no folder"
       : this.files === null ? "Reading the folder…"
-      : !this.files.length ? "No files here"
+      : !total ? "No files here"
       : !this.shown.length ? "Nothing matches" : null;
 
     return v_flex().id("open-file").track_focus(this.handle).w_full().min_h(0).p(18).gap(10)
@@ -197,7 +221,7 @@ export default class OpenFile extends View {
           .children(this.shown.map((hit, i) => this.row(hit, i, t)))))
       .when(this.shown.length > 0, (el) => el.child(
         h_flex().flex_none().px(9).gap(10).items_center().text_size(11).text_color(t.dim)
-          .child(div().flex_1().min_w(0).truncate().child(`${this.shown.length}${this.files.length > this.shown.length ? ` of ${this.files.length}` : ""} file${this.files.length === 1 ? "" : "s"}`))
+          .child(div().flex_1().min_w(0).truncate().child(`${this.shown.length}${total > this.shown.length ? ` of ${total}` : ""} file${total === 1 ? "" : "s"}`))
           .child(div().flex_none().child("↑↓ choose · ⏎ open · esc close"))));
   }
 }

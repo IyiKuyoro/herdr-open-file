@@ -58,8 +58,11 @@ With nothing published, the mod falls back to splitting a pane to the right runn
 - Anywhere else: `find`, skipping `.git`, `node_modules`, `dist`, `build` and other
   build and cache folders (the `SKIP` list in `main.js`).
 
-Up to 20,000 files are read when the picker opens and filtered in memory as you type,
-so typing never waits on the disk. Reopen it to pick up new files.
+Up to 20,000 files are read when the picker opens, and the shell's answer is cut off
+at 4 MB, so a space rooted at a whole home directory stays bounded. They are filtered
+in memory as you type, and ranked only when the files or the query change — never on
+a redraw — so typing never waits on the disk and a busy window never re-scores the
+list behind your back. Reopen the picker to pick up new files.
 
 Matching is a fuzzy subsequence over the whole path, scoring runs of adjacent letters,
 starts of path segments and matches in the file's own name — `mdl/usr` finds
